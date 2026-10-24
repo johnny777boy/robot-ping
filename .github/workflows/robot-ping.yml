@@ -1,0 +1,59 @@
+# robot-ping: outside alarm for the CI robot server. Public repo = free GitHub-hosted minutes. No third-party actions
+# (nothing to pin): plain git, python3 and the runner's own tools. Secrets (Actions secrets TG_TOKEN, TG_CHAT_ID) are
+# passed only as environment variables to the one step that sends, and are never echoed.
+name: robot-ping
+on:
+  schedule:
+    - cron: "7,37 * * * *"        # every 30 minutes (GitHub may delay a run; a late run is harmless)
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Send a test Telegram message instead of checking (proves the two secrets work)"
+        type: boolean
+        default: false
+permissions:
+  contents: write                 # only to save state.json on the branch `state` (no other scope)
+concurrency:
+  group: robot-ping
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the robot's last check-in
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LAST_SEEN: ${{ vars.ROBOT_LAST_SEEN }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SEND_TEST: ${{ inputs.send_test }}
+        run: |
+          set -eu
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::${AUTH#AUTHORIZATION: basic }"
+          URL="https://github.com/${REPO}.git"
+          git clone -q --depth 1 "$URL" src
+          mkdir st && cd st && git init -q && git remote add origin "$URL"
+          if git -c "http.extraheader=$AUTH" fetch -q --depth 1 origin state; then
+            git checkout -q -b state FETCH_HEAD
+          else
+            git checkout -q --orphan state
+          fi
+          cd ..
+          if [ "${SEND_TEST:-false}" = "true" ]; then
+            python3 src/check.py --state st/state.json --send-test
+            exit $?
+          fi
+          rc=0
+          python3 src/check.py --state st/state.json || rc=$?
+          cd st
+          if [ -f state.json ]; then
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git -c user.name=robot-ping -c user.email=robot-ping@users.noreply.github.com commit -q -m "robot-ping state"
+              git -c "http.extraheader=$AUTH" push -q origin HEAD:state
+            fi
+          fi
+          exit $rc
